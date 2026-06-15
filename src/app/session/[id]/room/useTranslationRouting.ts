@@ -6,28 +6,13 @@ import {
   ParticipantKind,
   RoomEvent,
   type RemoteParticipant,
-  type RemoteTrackPublication,
   Track,
 } from "livekit-client";
 import { NATIVE_LANG, PARTICIPANT_LANG_ATTR } from "@/lib/config";
-
-// Translator-track name format set by the Python agent in
-// translator/src/session.py: f"tx:{speaker_identity}:{target_lang}"
-const TRANSLATION_TRACK_PREFIX = "tx:";
-
-function parseTranslationTrackName(
-  name: string,
-): { sourceIdentity: string; targetLang: string } | null {
-  if (!name.startsWith(TRANSLATION_TRACK_PREFIX)) return null;
-  const parts = name.slice(TRANSLATION_TRACK_PREFIX.length).split(":");
-  if (parts.length < 2) return null;
-  // Identity can theoretically contain ":"; treat the last segment as the
-  // target language and join the rest back.
-  const targetLang = parts.pop()!;
-  const sourceIdentity = parts.join(":");
-  if (!sourceIdentity || !targetLang) return null;
-  return { sourceIdentity, targetLang };
-}
+import {
+  applyDesiredSubscription,
+  getTranslationTrackSubscription,
+} from "./translationRoutingCore";
 
 /**
  * Subscribes/unsubscribes to audio tracks based on the listener's chosen
@@ -52,6 +37,7 @@ export function useTranslationRouting(myLang: string) {
 
     const apply = () => {
       const remotes = Array.from(room.remoteParticipants.values());
+      const myIdentity = room.localParticipant.identity;
       const peerLangs = new Map<string, string | undefined>();
       for (const p of remotes) {
         if (p.kind === ParticipantKind.AGENT) continue;
@@ -60,7 +46,7 @@ export function useTranslationRouting(myLang: string) {
 
       for (const p of remotes) {
         if (p.kind === ParticipantKind.AGENT) {
-          applyAgentSubscriptions(p, myLang, peerLangs);
+          applyAgentSubscriptions(p, myLang, peerLangs, myIdentity);
         } else {
           applyHumanSubscriptions(p, myLang);
         }
@@ -74,7 +60,12 @@ export function useTranslationRouting(myLang: string) {
       [RoomEvent.ParticipantDisconnected, apply],
       [RoomEvent.ParticipantAttributesChanged, apply],
       [RoomEvent.TrackPublished, apply],
+      [RoomEvent.TrackSubscribed, apply],
+      [RoomEvent.TrackSubscriptionStatusChanged, apply],
       [RoomEvent.TrackUnpublished, apply],
+      [RoomEvent.TrackUnsubscribed, apply],
+      [RoomEvent.TrackMuted, apply],
+      [RoomEvent.TrackUnmuted, apply],
       [RoomEvent.LocalTrackPublished, apply],
     ];
     for (const [event, handler] of handlers) {
@@ -94,7 +85,7 @@ function applyHumanSubscriptions(p: RemoteParticipant, myLang: string) {
 
   for (const pub of p.audioTrackPublications.values()) {
     if (pub.source !== Track.Source.Microphone) continue;
-    setSubscribed(pub, hearNative);
+    applyDesiredSubscription(pub, hearNative);
   }
 }
 
@@ -102,29 +93,21 @@ function applyAgentSubscriptions(
   agent: RemoteParticipant,
   myLang: string,
   peerLangs: Map<string, string | undefined>,
+  myIdentity: string,
 ) {
   for (const pub of agent.audioTrackPublications.values()) {
-    const parsed = parseTranslationTrackName(pub.trackName);
-    if (!parsed) {
+    const desired = getTranslationTrackSubscription(
+      pub.trackName,
+      myLang,
+      peerLangs,
+      NATIVE_LANG,
+      myIdentity,
+    );
+    if (desired === null) {
       // Not a translation track (e.g., agent state audio). Don't touch.
       continue;
     }
 
-    if (myLang === NATIVE_LANG) {
-      setSubscribed(pub, false);
-      continue;
-    }
-
-    const matchesMe = parsed.targetLang === myLang;
-    const speakerLang = peerLangs.get(parsed.sourceIdentity);
-    const speakerNotMyLang = speakerLang !== myLang;
-
-    setSubscribed(pub, matchesMe && speakerNotMyLang);
-  }
-}
-
-function setSubscribed(pub: RemoteTrackPublication, desired: boolean) {
-  if (pub.isSubscribed !== desired) {
-    pub.setSubscribed(desired);
+    applyDesiredSubscription(pub, desired);
   }
 }
